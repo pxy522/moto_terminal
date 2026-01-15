@@ -1,0 +1,16 @@
+#pragma once
+
+#include <Arduino.h>
+
+// 简单的串口屏助手（例如 Nextion）
+// 使用方法：
+// SS_init(&Serial2, 115200, 17, 18);
+// SS_setText("t0", "Hello");
+// SS_setNumber("n0", 123);
+
+// 指定 txPin/rxPin，以便在 ESP32 上使用指定引脚
+void SS_init(HardwareSerial* serialPort, uint32_t baud, int txPin, int rxPin);
+void SS_sendCommand(const char* cmd);
+void SS_setText(const char* objName, const char* text);
+void SS_setNumber(const char* objName, long value);
+
