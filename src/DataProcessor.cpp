@@ -7,9 +7,6 @@ extern char name[50];
 // 简单数组缓冲：固定 10 个样本
 static const size_t BATCH_N = 10;
 static const size_t BATCH_X = 100;
-static float jy901_x[BATCH_X];//加速度
-static float jy901_y[BATCH_X];
-static float jy901_z[BATCH_X];
 static float wind[BATCH_N];//风速
 static unsigned int degree[BATCH_N];//风向
 static float hum[BATCH_N];//湿度
@@ -21,10 +18,38 @@ static unsigned int AS_Lux[BATCH_N]; //AS模块光照
 static unsigned int AS_Red[BATCH_N]; //AS模块红外
 static size_t g_count = 0; // 已填充样本数量（按索引推进）
 //SD卡写入量
+// 第2部分：全局变量（添加到DataProcessor.cpp顶部）
+// ============================================================================
+
 float jy901_vx = 0.0f; // x方向线速度
 float jy901_vy = 0.0f; // y方向线速度
 float jy901_vz = 0.0f; // z方向线速度
-static float lowpass_acc[3] = {0.0f, 0.0f, 0.0f}; // 低通滤波加速度
+
+// 校准相关
+static float acc_bias_x = 0.0f;
+static float acc_bias_y = 0.0f;
+static float acc_bias_z = 0.0f;
+static bool is_calibrated = false;
+static uint32_t calib_count = 0;
+static bool calib_requested = false;  // 手动触发校准标志
+
+// 低通滤波器状态
+static float lpf_ax = 0.0f;
+static float lpf_ay = 0.0f;
+static float lpf_az = 0.0f;
+
+// 零速检测
+static uint32_t stationary_count = 0;
+static uint32_t moving_count = 0;
+
+// 振动检测
+static float vibration_history[10] = {0};  // 最近10次加速度模长
+static uint8_t vibration_idx = 0;
+
+// 速度平滑
+static float speed_history[5] = {0};  // 最近5次速度
+static uint8_t speed_idx = 0;
+
 float SD_windSpeed;
 unsigned int SD_winddeg;
 float SD_hum;
@@ -49,108 +74,225 @@ GLOVE_DATA Glove_data;
 GLOVE_DATA CKP_data;
 
 
+// ============================================================================
+// 第3部分：辅助函数
+// ============================================================================
+
 /**
- * @brief IMU数据解算，将加速度转换为线速度
- * @param 加速度单位为(m/s²)
+ * @brief 计算数组平均值
  */
-void DP_jy901(float ax_g, float ay_g, float az_g, float pitch, float roll)
-{   
-
-    static uint32_t last_time_us = 0;
-    uint32_t current_time_us = micros();  // 获取当前时间（微秒）
-    
-static int debug_count = 0;
-    debug_count++;
-    
-    // 每50次（约1秒）打印一次完整数据
-    if (debug_count % 50 == 0) {
-        Serial.println("\n=== IMU数据诊断 ===");
-        Serial.printf("原始加速度: ax=%.3f, ay=%.3f, az=%.3f m/s²\n", 
-                     ax_g, ay_g, az_g);
-        Serial.printf("角度: pitch=%.2f°, roll=%.2f°\n", pitch, roll);
-
-        // 计算重力分量
-        float roll_rad = roll * PI / 180.0f;
-        float pitch_rad = pitch * PI / 180.0f;
-        float g = 9.80665f;
-        float gx = -g * sinf(pitch_rad);
-        float gy = g * sinf(roll_rad) * cosf(pitch_rad);
-        float gz = g * cosf(roll_rad) * cosf(pitch_rad);
-        
-        Serial.printf("重力分量: gx=%.3f, gy=%.3f, gz=%.3f m/s²\n", gx, gy, gz);
-        
-        // 线性加速度（补偿后）
-        float ax_lin = ax_g / 9.8f - gx;
-        float ay_lin = ay_g /9.8f - gy;
-        float az_lin = az_g /9.8f - gz;
-        
-        Serial.printf("线性加速度: lin_x=%.3f, lin_y=%.3f, lin_z=%.3f m/s²\n", 
-                     ax_lin, ay_lin, az_lin);
-        Serial.printf("当前速度: vx=%.2f, vy=%.2f m/s\n", jy901_vx, jy901_vy);
-        Serial.println("===================\n");
+static float array_mean(float *arr, uint8_t len) {
+    float sum = 0.0f;
+    for (uint8_t i = 0; i < len; i++) {
+        sum += arr[i];
     }
-    
+    return sum / len;
+}
 
-    // 第一次调用时只记录时间，不积分
+/**
+ * @brief 计算数组标准差（检测振动）
+ */
+static float array_std(float *arr, uint8_t len) {
+    float mean = array_mean(arr, len);
+    float sum_sq = 0.0f;
+    for (uint8_t i = 0; i < len; i++) {
+        float diff = arr[i] - mean;
+        sum_sq += diff * diff;
+    }
+    return sqrtf(sum_sq / len);
+}
+
+/**
+ * @brief 检测是否在振动（发动机运转）
+ * @return true=在振动（怠速/行驶），false=真正静止（熄火）
+ */
+static bool is_vibrating() {
+    float std_dev = array_std(vibration_history, 10);
+    
+    // 标准差大于0.2说明在振动（发动机运转或行驶）
+    return (std_dev > 0.2f);
+}
+
+/**
+ * @brief 获取平滑后的速度（推荐用于显示）
+ */
+float Motorcycle_GetSmoothSpeed() {
+    return array_mean(speed_history, 5);
+}
+
+// ============================================================================
+// 第4部分：摩托车专用速度解算函数
+// ============================================================================
+
+/**
+ * @brief 摩托车专用IMU速度解算
+ * 
+ * @param ax_mss X轴加速度（已去除重力），单位 m/s²
+ * @param ay_mss Y轴加速度（已去除重力），单位 m/s²
+ * @param az_mss Z轴加速度（已去除重力），单位 m/s²
+ * @param pitch 俯仰角，单位度
+ * @param roll 横滚角，单位度
+ * 
+ * 特点：
+ * - 大死区（0.5 m/s²）应对振动
+ * - 低通滤波平滑数据
+ * - 智能零速检测（区分停车和怠速）
+ * - 弱速度衰减（不影响正常行驶）
+ */
+void DP_jy901_Motorcycle(float ax_mss, float ay_mss, float az_mss, float pitch, float roll)
+{   
+    static uint32_t last_time_us = 0;
+    uint32_t current_time_us = micros();
+    
+    // ========== 时间差计算 ==========
     if (last_time_us == 0) {
         last_time_us = current_time_us;
         return;
     }
     
-    // 计算实际时间差（秒）
-    float dt = (current_time_us - last_time_us) / 1000000.0f;  // 转换为秒
+    float dt;
+    if (current_time_us >= last_time_us) {
+        dt = (current_time_us - last_time_us) / 1000000.0f;
+    } else {
+        dt = ((0xFFFFFFFF - last_time_us) + current_time_us + 1) / 1000000.0f;
+    }
     last_time_us = current_time_us;
     
-    // 验证dt在合理范围内
-    if (dt < 0.001f || dt > 0.1f) {  // 异常时间间隔
-        dt = 0.02f;  // 使用默认值
-        // BLE_sendf("异常dt: %.4f秒", dt);  // 调试用
+    // 跳过异常时间间隔
+    if (dt < 0.005f || dt > 0.1f) {
+        return;
     }
 
-    float forward_accel = ax_g;
-    float lateral_accel = ay_g;
-    float vertical_accel = az_g;
+    // ========== 振动历史记录 ==========
+    float acc_magnitude = sqrtf(ax_mss * ax_mss + ay_mss * ay_mss + az_mss * az_mss);
+    vibration_history[vibration_idx] = acc_magnitude;
+    vibration_idx = (vibration_idx + 1) % 10;
 
-   // 使用高通滤波分离噪声
-    // 这对于摩托车很重要，因为摩托车会倾斜，重力会分解到各个轴
-    const float alpha = 0.05f; // 低通滤波系数，用于估计重力分量
-
-    // 更新低通滤波值（估计重力/低频分量）
-    lowpass_acc[0] = alpha * forward_accel + (1.0f - alpha) * lowpass_acc[0];
-    lowpass_acc[1] = alpha * lateral_accel + (1.0f - alpha) * lowpass_acc[1];
-    lowpass_acc[2] = alpha * vertical_accel + (1.0f - alpha) * lowpass_acc[2];
-    
-    // 高通滤波：原始值减去低频分量得到运动加速度
-    float motion_forward_accel = forward_accel - lowpass_acc[0];
-    float motion_lateral_accel = lateral_accel - lowpass_acc[1];
-    
-    // 计算线速度（简单积分）
-    jy901_vx += motion_forward_accel * dt;
-    jy901_vy += motion_lateral_accel * dt;
-    jy901_vz += az_g * 9.8f * dt;
-
-    // 零速检测
-
-
-}
-
-void DP_weather(float windSpeed_m_s,unsigned int windDir_deg,float humidity_pct,
-                 float temperature_C,float pressure_kPa,float lux20_hundredLux,
-                 float rain_mm)
-{
-    wind[g_count] = windSpeed_m_s;
-    degree[g_count] = windDir_deg;
-    hum[g_count] = humidity_pct;
-    temp[g_count] = temperature_C;
-    pressure[g_count] = pressure_kPa;
-    Lux[g_count] = lux20_hundredLux;
-    rain[g_count] = rain_mm;
-
-    g_count++;
-    if (g_count >= BATCH_N) 
-    {
-        g_count = 0;
+    // ========== 智能校准（只在熄火静止时校准）==========
+    if (calib_requested && !is_calibrated) {
+        // 检查是否真的静止（无振动）
+        if (!is_vibrating() && acc_magnitude < 0.3f) {
+            if (calib_count < 100) {  // 100次 * 20ms = 2秒
+                acc_bias_x += ax_mss;
+                acc_bias_y += ay_mss;
+                acc_bias_z += az_mss;
+                calib_count++;
+                
+                if (calib_count == 100) {
+                    acc_bias_x /= 100.0f;
+                    acc_bias_y /= 100.0f;
+                    acc_bias_z /= 100.0f;
+                    is_calibrated = true;
+                    calib_requested = false;
+                    
+                    Serial.printf("[摩托车IMU] 校准完成: 偏置=(%.4f, %.4f, %.4f)\n", 
+                                 acc_bias_x, acc_bias_y, acc_bias_z);
+                }
+                return;
+            }
+        } else {
+            // 如果检测到振动，重置校准
+            if (calib_count > 0) {
+                Serial.println("[摩托车IMU] 校准中断（检测到振动），请在熄火静止时校准");
+                calib_count = 0;
+                acc_bias_x = 0.0f;
+                acc_bias_y = 0.0f;
+                acc_bias_z = 0.0f;
+            }
+        }
     }
+    
+    // 减去偏置（如果已校准）
+    if (is_calibrated) {
+        ax_mss -= acc_bias_x;
+        ay_mss -= acc_bias_y;
+        az_mss -= acc_bias_z;
+    }
+
+    // ========== 低通滤波（平滑振动）==========
+    // 截止频率约10Hz，可以过滤发动机振动（通常30-50Hz）
+    const float LPF_ALPHA = 0.3f;  // alpha越小，滤波越强
+    
+    lpf_ax = LPF_ALPHA * ax_mss + (1.0f - LPF_ALPHA) * lpf_ax;
+    lpf_ay = LPF_ALPHA * ay_mss + (1.0f - LPF_ALPHA) * lpf_ay;
+    lpf_az = LPF_ALPHA * az_mss + (1.0f - LPF_ALPHA) * lpf_az;
+    
+    // 使用滤波后的加速度
+    ax_mss = lpf_ax;
+    ay_mss = lpf_ay;
+    az_mss = lpf_az;
+
+    // ========== 大死区（应对振动噪声）==========
+    const float DEADZONE = 0.5f;  // 0.5 m/s²，应对发动机振动
+    
+    if (fabsf(ax_mss) < DEADZONE) ax_mss = 0.0f;
+    if (fabsf(ay_mss) < DEADZONE) ay_mss = 0.0f;
+    if (fabsf(az_mss) < DEADZONE) az_mss = 0.0f;
+
+    // ========== 智能零速检测（区分停车和怠速）==========
+    float vel_magnitude = sqrtf(jy901_vx*jy901_vx + jy901_vy*jy901_vy + jy901_vz*jy901_vz);
+    
+    // 方法：同时检测加速度小、速度小、无振动
+    const float STATIONARY_ACC_THRESHOLD = 0.3f;
+    const float STATIONARY_VEL_THRESHOLD = 0.1f;   // 0.36 km/h
+    const uint32_t STATIONARY_COUNT_LIMIT = 100;   // 100次 * 20ms = 2秒
+    
+    // 真正静止的条件：加速度小 + 速度小 + 无振动
+    bool truly_stationary = (acc_magnitude < STATIONARY_ACC_THRESHOLD) && 
+                           (vel_magnitude < STATIONARY_VEL_THRESHOLD) &&
+                           (!is_vibrating());
+    
+    if (truly_stationary) {
+        stationary_count++;
+        moving_count = 0;
+        
+        if (stationary_count >= STATIONARY_COUNT_LIMIT) {
+            // 真正静止（熄火停车），重置速度
+            jy901_vx = 0.0f;
+            jy901_vy = 0.0f;
+            jy901_vz = 0.0f;
+            stationary_count = STATIONARY_COUNT_LIMIT;
+            return;
+        }
+    } else {
+        // 在移动或怠速
+        stationary_count = 0;
+        moving_count++;
+    }
+
+    // ========== 速度积分 ==========
+    jy901_vx += ax_mss * dt;
+    jy901_vy += ay_mss * dt;
+    jy901_vz += az_mss * dt;
+
+    // ========== 弱速度衰减（不影响正常行驶）==========
+    // 只在怠速状态（有振动但速度小）时才衰减
+    bool is_idling = is_vibrating() && (vel_magnitude < 2.0f);  // 速度<7.2km/h且振动
+    
+    if (is_idling) {
+        // 怠速时强衰减（对抗累积漂移）
+        const float DECAY_IDLE = 0.990f;  // 每次衰减1%
+        jy901_vx *= DECAY_IDLE;
+        jy901_vy *= DECAY_IDLE;
+        jy901_vz *= DECAY_IDLE;
+    } else if (moving_count > 50) {  // 确认在移动（1秒以上）
+        // 行驶时极弱衰减（几乎不衰减）
+        const float DECAY_MOVING = 0.9995f;  // 每次衰减0.05%
+        jy901_vx *= DECAY_MOVING;
+        jy901_vy *= DECAY_MOVING;
+        jy901_vz *= DECAY_MOVING;
+    }
+
+    // ========== 速度平滑（移动平均）==========
+    speed_history[speed_idx] = vel_magnitude;
+    speed_idx = (speed_idx + 1) % 5;
+
+    // ========== 速度限幅（摩托车最高速）==========
+    const float MAX_SPEED = 60.0f;  // 60 m/s = 216 km/h（留余量）
+    
+    if (fabsf(jy901_vx) > MAX_SPEED) jy901_vx = (jy901_vx > 0) ? MAX_SPEED : -MAX_SPEED;
+    if (fabsf(jy901_vy) > MAX_SPEED) jy901_vy = (jy901_vy > 0) ? MAX_SPEED : -MAX_SPEED;
+    if (fabsf(jy901_vz) > MAX_SPEED) jy901_vz = (jy901_vz > 0) ? MAX_SPEED : -MAX_SPEED;
 }
 
 void DP_AS7341(unsigned int AS_Lux_ch,unsigned int AS_Red_ch)

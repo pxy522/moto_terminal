@@ -25,6 +25,9 @@ extern GLOVE_DATA Glove_data;
 
 void removeGravity(float pitch, float roll);
 void DP_jy901(float ax_g,float ay_g,float az_g, float pitch, float roll);// 处理 JY901 加速度数据
+void DP_jy901_Motorcycle(float ax_mss, float ay_mss, float az_mss, float pitch, float roll); // 摩托车专用IMU处理
+float Motorcycle_GetSmoothSpeed();//线速度数据平滑显示
+
 void DP_weather(float windSpeed_m_s,unsigned int windDir_deg,float humidity_pct,
                  float temperature_C,float pressure_kPa,float lux20_hundredLux,
                  float rain_mm);// 处理气象数据
